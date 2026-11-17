@@ -2,7 +2,7 @@ import { MongoClient } from 'mongodb';
 
 const uri    = process.env.MONGO_URI;
 const SECRET = process.env.BATCH_SECRET;
-const DB     = 'sar-sg-ops';
+const DB     = process.env.MONGO_DB || 'sar-sg-ops';
 const TTL_MS = 6 * 60 * 60 * 1000;
 
 let mongoClient;

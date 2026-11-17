@@ -5,7 +5,7 @@
 import { MongoClient } from 'mongodb';
 
 const uri = process.env.MONGO_URI;
-const DB  = 'sar-sg-ops';
+const DB  = process.env.MONGO_DB || 'sar-sg-ops';
 // Every push wipes and re-inserts these (api/mongo-batch.js, api/wip.js), so the newest _id in
 // each is the time of its latest push, the same rule as the dashboard's own "Data last synced".
 const DATA_COLLECTIONS = ['th_ops_export', 'th_ops_import', 'th_ops_crosstrade', 'th_ops_wip'];

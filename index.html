@@ -2786,9 +2786,20 @@ function handleAuth() {
     client_id: CLIENT_ID,
     callback: async (response) => {
       try {
-        const parts = response.credential.split('.');
-        const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-        await verifyUser({ email: payload.email, name: payload.name, picture: payload.picture });
+        // SOP Template A: Google's token is checked on the server (api/google-verify.js),
+        // which also does the users-collection lookup (email + active: true).
+        const r = await fetch('/api/google-verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ credential: response.credential }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.user) {
+          showSigninError(data.error || 'Sign-in failed. Please try again.');
+          document.getElementById('signinBtn').style.display = 'flex';
+          return;
+        }
+        await verifyUser(data.user);
       } catch(e) {
         console.error('Auth error:', e);
         showSigninError('Sign-in failed. Please try again.');
@@ -2812,24 +2823,12 @@ function handleAuth() {
   );
 }
 
-async function verifyUser(info) {
+// user = the record api/google-verify.js returned (already checked: email + active: true)
+async function verifyUser(user) {
   try {
-    const email = (info.email || '').toLowerCase().trim();
-    const resp = await fetch(MONGO_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'findOne', collection: 'users', filter: { email, active: true } })
-    });
-    const data = await resp.json();
-    const user = data.document;
+    const email = (user.email || '').toLowerCase().trim();
 
-    if (!user) {
-      showSigninError('Access denied. ' + email + ' is not authorised. Contact your administrator.');
-      document.getElementById('signinBtn').style.display = 'flex';
-      return;
-    }
-
-    currentUser    = { email, name: info.name || user.name, picture: info.picture };
+    currentUser    = { email, name: user.name || email, picture: user.picture };
     currentRole    = user.role || 'Viewer';
     currentUserDoc = user;
     // Resolve inherited zones/branches for Job Owner via reporting manager
