@@ -1,0 +1,128 @@
+import { MongoClient } from 'mongodb';
+
+const uri    = process.env.MONGO_URI;
+const SECRET = process.env.BATCH_SECRET;
+const DB     = 'sar-sg-ops';
+const TTL_MS = 6 * 60 * 60 * 1000; // 6 hrs
+
+let mongoClient;
+async function getClient() {
+  if (!mongoClient) {
+    mongoClient = new MongoClient(uri, { maxPoolSize: 5, socketTimeoutMS: 45000 });
+    await mongoClient.connect();
+  }
+  return mongoClient;
+}
+
+let cache = { data: null, builtAt: null };
+
+async function buildCache(db) {
+  console.log('[TH-OPS] Building cache...');
+  const expDocs   = await db.collection('th_ops_export').find({}).toArray();
+  const impDocs   = await db.collection('th_ops_import').find({}).toArray();
+  const userDocs  = await db.collection('users').find({}).toArray();
+  // Cross Trade now merged into allDocs - each record carries its own lob
+  // (FES/FIS/FEA/FIA/FER/FIR) and a direction derived from it on the
+  // dashboard side (getRecordDirection()), matching existing filtering
+  const crossTradeDocs = await db.collection('th_ops_crosstrade').find({}).toArray();
+  // The Cross Trade sheet names some columns differently from the Export/Import
+  // sheets (e.g. "Job Operator" -> jobOperator instead of operator). Copy them
+  // to the standard names so drill-downs, owner grouping/filters and row-level
+  // access treat Cross Trade jobs like every other job (same as Indonesia).
+  const CROSS_TRADE_FIELD_MAP = {
+    jobOperator:  'operator',
+    jobSalesRep:  'salesRep',
+    jobOpened:    'jobOpenedDate',
+    etdFirstLoad: 'etdDate',
+    inner:        'innerPkgs',
+    outer:        'outerPkgs',
+  };
+  const empty = v => v === undefined || v === null || v === '';
+  for (const d of crossTradeDocs) {
+    for (const [from, to] of Object.entries(CROSS_TRADE_FIELD_MAP)) {
+      if (empty(d[to]) && !empty(d[from])) d[to] = d[from];
+    }
+  }
+  // Jobs in the Cross Trade sheet are usually also in the Export or Import sheet,
+  // which made the dashboard count them twice (and double their WIP). Keep one
+  // record per job: the Export/Import copy (it carries Job Owner / Sales Rep),
+  // labelled "Other/Cross Trade" so it still shows as a cross trade job; the
+  // Cross Trade copy is dropped. Its LOB is untouched, so it stays on the same page.
+  const ship = d => String(d.shipmentId || '').trim().toUpperCase();
+  const expImpById = new Map();
+  for (const d of [...expDocs, ...impDocs]) if (ship(d) && !expImpById.has(ship(d))) expImpById.set(ship(d), d);
+  const hasLob = d => /^.[EI]/i.test(String(d.lob || ''));
+  let dropped = 0;
+  const crossTradeKept = crossTradeDocs.filter(d => {
+    const twin = ship(d) && expImpById.get(ship(d));
+    if (!twin) return true;
+    if (hasLob(twin)) twin.direction = d.direction || 'Other/Cross Trade';
+    dropped++;
+    return false;
+  });
+  const allDocs  = [...expDocs, ...impDocs, ...crossTradeKept];
+  console.log(`[TH-OPS] Total docs: ${allDocs.length} (exp: ${expDocs.length}, imp: ${impDocs.length}, crossTrade: ${crossTradeDocs.length}, duplicates dropped: ${dropped}), users: ${userDocs.length}`);
+  // Records are re-inserted on every sheet sync, so the newest ObjectId's
+  // timestamp is when the data was last synced into the database
+  const newest = allDocs.reduce((max, d) => {
+    const ts = d._id && typeof d._id.getTimestamp === 'function' ? d._id.getTimestamp().getTime() : 0;
+    return ts > max ? ts : max;
+  }, 0);
+  cache = { data: allDocs, users: userDocs, builtAt: new Date().toISOString(), lastSyncAt: newest ? new Date(newest).toISOString() : null };
+  return cache;
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-batch-secret');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  if (req.method === 'POST') {
+    const secret = req.headers['x-batch-secret'];
+    if (!secret || secret !== SECRET) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { action, records, direction } = req.body;
+
+    if (action === 'wipe') {
+      const c  = await getClient();
+      const db = c.db(DB);
+      const colName = direction === 'Export' ? 'th_ops_export' : direction === 'Import' ? 'th_ops_import' : direction === 'CrossTrade' ? 'th_ops_crosstrade' : null;
+      if (!colName) return res.status(400).json({ error: 'Invalid direction' });
+      const result = await db.collection(colName).deleteMany({});
+      cache = { data: null, builtAt: null };
+      return res.status(200).json({ deleted: result.deletedCount, direction });
+    }
+
+    if (action === 'push') {
+      if (!records || !records.length) return res.status(400).json({ error: 'No records' });
+      const c  = await getClient();
+      const db = c.db(DB);
+      const colName = direction === 'Export' ? 'th_ops_export' : direction === 'CrossTrade' ? 'th_ops_crosstrade' : 'th_ops_import';
+      const result = await db.collection(colName).insertMany(records, { ordered: false });
+      cache = { data: null, builtAt: null };
+      return res.status(200).json({ inserted: result.insertedCount, direction });
+    }
+
+    return res.status(400).json({ error: 'Unknown action' });
+  }
+
+  if (req.method === 'GET') {
+    try {
+      const now = new Date();
+      if (!cache.data || !cache.builtAt || (now - new Date(cache.builtAt)) > TTL_MS) {
+        const c  = await getClient();
+        const db = c.db(DB);
+        await buildCache(db);
+      }
+      res.setHeader('X-Cache', 'HIT');
+      res.setHeader('X-Cache-Age', Math.floor((new Date() - new Date(cache.builtAt)) / 1000));
+      return res.status(200).json({ records: cache.data, users: cache.users || [], builtAt: cache.builtAt, lastSyncAt: cache.lastSyncAt || null });
+    } catch (e) {
+      console.error(e);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+
+  return res.status(405).json({ error: 'Method not allowed' });
+}
